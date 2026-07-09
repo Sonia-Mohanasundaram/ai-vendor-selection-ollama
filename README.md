@@ -5,8 +5,8 @@ A clean, modular Streamlit prototype to compare multiple vendor quotations (PDF,
 ## Quick Start (Streamlit)
 
 ```bash
-pip install -r requirements.txt
-streamlit run app/streamlit_app.py
+python -m pip install -r requirements.txt
+python -m streamlit run app/streamlit_app.py
 ```
 
 ## Quick Start (React UI + API backend)
@@ -14,8 +14,8 @@ streamlit run app/streamlit_app.py
 Backend (FastAPI):
 
 ```bash
-pip install -r requirements.txt
-uvicorn backend.main:app --reload --port 8000
+python -m pip install -r requirements.txt
+python -m uvicorn backend.main:app --reload --port 8000
 ```
 
 Frontend (Vite/React):
@@ -25,6 +25,8 @@ cd "ui/ai-outreach-hub-main (2)/ai-outreach-hub-main"
 npm install
 npm run dev
 ```
+
+On Windows, activate the virtual environment first, then use `python -m ...` commands. This avoids broken launcher paths if the project folder was moved.
 
 The UI calls the backend at `http://localhost:8000` by default. To change it, set `VITE_API_BASE_URL` in the frontend.
 
