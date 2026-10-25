@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = (
     ".pdf",
+    ".docx",
     ".csv",
     ".xlsx",
     ".jpg",
     ".jpeg",
     ".png",
+    ".webp",
     ".bmp",
     ".tiff",
     ".tif",
@@ -56,14 +58,16 @@ def ingest_bytes(file_bytes: bytes, filename: str) -> str:
 
     if filename_l.endswith(".pdf"):
         return _extract_pdf(file_bytes)
+    if filename_l.endswith(".docx"):
+        return _extract_docx(file_bytes)
     if filename_l.endswith((".xlsx", ".csv")):
         return _extract_table(file_bytes, filename_l)
     if filename_l.endswith(".xls"):
         raise ValueError("'.xls' is not supported. Please export as .xlsx or .csv.")
-    if filename_l.endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif")):
+    if filename_l.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif")):
         return extract_text_from_image(file_bytes)
     raise ValueError(
-        f"Unsupported file format: '{filename}'. Please upload PDF, CSV/XLSX, or image files."
+        f"Unsupported file format: '{filename}'. Please upload PDF, DOCX, CSV/XLSX, or image files."
     )
 
 
@@ -75,13 +79,51 @@ def preview_file(file_bytes: bytes, filename: str) -> dict:
     name = (filename or "").lower()
     if name.endswith(".pdf"):
         return {"type": "pdf"}
-    if name.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif")):
+    if name.endswith(".docx"):
+        return {"type": "text"}
+    if name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")):
         return {"type": "image"}
     if name.endswith(".csv"):
         return {"type": "table", "df": _preview_csv(file_bytes)}
     if name.endswith(".xlsx"):
         return {"type": "table", "df": _preview_xlsx(file_bytes)}
     return {"type": "unknown"}
+
+
+def _extract_docx(file_bytes: bytes) -> str:
+    try:
+        from docx import Document
+
+        document = Document(io.BytesIO(file_bytes))
+    except Exception as exc:
+        logger.exception("Failed to parse DOCX")
+        raise RuntimeError(f"Failed to parse DOCX: {exc}") from exc
+
+    parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+    field_labels = (
+        "vendor", "supplier", "item", "product", "description", "quantity", "qty",
+        "unit price", "rate", "subtotal", "total", "gst", "tax", "freight",
+        "delivery", "payment", "discount",
+    )
+    for table in document.tables:
+        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        if not rows:
+            continue
+        headers = rows[0]
+        has_headers = sum(
+            any(label in header.lower() for label in field_labels)
+            for header in headers
+        ) >= 2
+        if has_headers:
+            for row in rows[1:]:
+                parts.extend(
+                    f"{header}: {value}"
+                    for header, value in zip(headers, row)
+                    if header and value
+                )
+        else:
+            parts.extend(" | ".join(value for value in row if value) for row in rows)
+    return "\n".join(parts)
 
 
 def _extract_pdf(file_bytes: bytes) -> str:

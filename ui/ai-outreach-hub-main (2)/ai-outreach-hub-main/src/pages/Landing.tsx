@@ -47,8 +47,8 @@ const Landing = () => {
             in 30 seconds.
           </h1>
           <p className="text-lg md:text-xl text-muted-foreground max-w-2xl mx-auto mb-10">
-            Upload PDFs, spreadsheets and quotation images. We extract, normalize and compare across cost,
-            delivery and payment terms — then tell you exactly why one vendor wins.
+            Upload quotations, describe your priorities, and get a local AI comparison of extracted cost,
+            delivery and payment evidence — including missing details and uncertainty.
           </p>
           <div className="flex flex-wrap justify-center gap-3">
             <Link to="/dashboard">
@@ -62,17 +62,8 @@ const Landing = () => {
               </Button>
             </a>
           </div>
-          <div className="mt-16 grid grid-cols-3 gap-8 max-w-2xl mx-auto text-left">
-            {[
-              { v: "10x", l: "faster procurement" },
-              { v: "95%", l: "extraction accuracy" },
-              { v: "₹2.4L", l: "avg. savings / RFQ" },
-            ].map((s) => (
-              <div key={s.l} className="glass rounded-2xl p-4 shadow-card">
-                <div className="text-2xl md:text-3xl font-bold text-gradient">{s.v}</div>
-                <div className="text-xs text-muted-foreground mt-1">{s.l}</div>
-              </div>
-            ))}
+          <div className="mt-12 text-sm text-muted-foreground">
+            Local Ollama model · Evidence-based explanations · No paid AI API
           </div>
         </div>
       </section>
@@ -86,10 +77,10 @@ const Landing = () => {
           </div>
           <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
             {[
-              { icon: BarChart3, title: "Vendor Comparison", desc: "Side-by-side scoring across price, GST, freight and terms.", grad: "from-blue-500 to-cyan-500" },
-              { icon: Wallet, title: "Cost Intelligence", desc: "Includes credit cost so payment terms become real money.", grad: "from-violet-500 to-purple-500" },
-              { icon: Zap, title: "Fast Processing", desc: "Drop 10 quotes — get a recommendation in seconds.", grad: "from-amber-500 to-orange-500" },
-              { icon: FileStack, title: "Multi-format Upload", desc: "PDF, image, CSV, Excel — we handle the messy ones too.", grad: "from-emerald-500 to-teal-500" },
+              { icon: BarChart3, title: "Requirement-led comparison", desc: "The local model adapts its qualitative evaluation to your priorities.", grad: "from-blue-500 to-cyan-500" },
+              { icon: Wallet, title: "Verified quotation totals", desc: "Known base price, GST and freight are calculated deterministically; unknown charges stay unknown.", grad: "from-violet-500 to-purple-500" },
+              { icon: Zap, title: "Transparent trade-offs", desc: "Review each vendor's advantages, drawbacks, risks and confidence.", grad: "from-amber-500 to-orange-500" },
+              { icon: FileStack, title: "Multi-format upload", desc: "Extract quotation data from PDF, image, CSV and Excel files.", grad: "from-emerald-500 to-teal-500" },
             ].map((f) => (
               <div key={f.title} className="group rounded-2xl p-6 bg-card border shadow-card hover:shadow-elevated transition">
                 <div className={`h-12 w-12 rounded-xl bg-gradient-to-br ${f.grad} flex items-center justify-center mb-4 shadow-glow group-hover:scale-110 transition`}>
@@ -108,14 +99,14 @@ const Landing = () => {
         <div className="container">
           <div className="text-center max-w-2xl mx-auto mb-16">
             <h2 className="text-4xl font-bold mb-4">From PDF to decision in 4 steps</h2>
-            <p className="text-muted-foreground text-lg">No setup. No training data. Just drop and go.</p>
+            <p className="text-muted-foreground text-lg">Run Ollama locally, upload quotations, then review the evidence.</p>
           </div>
           <div className="grid md:grid-cols-4 gap-6">
             {[
-              { icon: Upload, title: "Upload files", desc: "Drag 3–10 vendor quotations." },
-              { icon: Layers, title: "Extract data", desc: "OCR + parsers pull line items, taxes and terms." },
-              { icon: TrendingUp, title: "Compare vendors", desc: "Weighted scoring across cost, delivery and terms." },
-              { icon: Trophy, title: "Get the winner", desc: "A clear recommendation with plain-English reasoning." },
+              { icon: Upload, title: "Upload files", desc: "Add 2–10 vendor quotations and state your priorities." },
+              { icon: Layers, title: "Extract evidence", desc: "Existing PDF, table and OCR parsers collect quotation details." },
+              { icon: TrendingUp, title: "Evaluate locally", desc: "Ollama compares the extracted data against your requirements." },
+              { icon: Trophy, title: "Review the result", desc: "See rankings, risks, missing fields or an inconclusive outcome." },
             ].map((s, i) => (
               <div key={s.title} className="relative rounded-2xl p-6 bg-card border shadow-card">
                 <div className="absolute -top-4 -left-4 h-10 w-10 rounded-xl gradient-primary flex items-center justify-center text-primary-foreground font-bold shadow-glow">
@@ -134,58 +125,21 @@ const Landing = () => {
       <section id="sample" className="py-24 bg-muted/30">
         <div className="container">
           <div className="text-center max-w-2xl mx-auto mb-12">
-            <h2 className="text-4xl font-bold mb-4">A taste of the output</h2>
-            <p className="text-muted-foreground text-lg">Cost-normalized, term-adjusted, decision-ready.</p>
+            <h2 className="text-4xl font-bold mb-4">What an evaluation includes</h2>
+            <p className="text-muted-foreground text-lg">Results are generated from your uploaded quotations—not from a fabricated sample ranking.</p>
           </div>
           <div className="grid lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 rounded-2xl bg-card border shadow-elevated overflow-hidden">
-              <div className="px-5 py-3 border-b bg-muted/40 text-sm font-medium">Vendor comparison</div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead className="bg-muted/30 text-muted-foreground">
-                    <tr>
-                      {["Vendor","Total (INR)","Delivery","Payment","Score"].map((h) => (
-                        <th key={h} className="text-left px-4 py-2 font-medium">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {[
-                      { v: "Acme Industrial", t: "2,18,400", d: "12d", p: "Net 45", s: "94%", best: true },
-                      { v: "Bharat Supplies", t: "2,32,100", d: "10d", p: "Net 30", s: "88%" },
-                      { v: "Crown Vendors",  t: "2,46,800", d: "18d", p: "Net 60", s: "79%" },
-                    ].map((r) => (
-                      <tr key={r.v} className="border-t">
-                        <td className="px-4 py-3 font-medium">
-                          {r.v}
-                          {r.best && <span className="ml-2 text-xs px-2 py-0.5 rounded-full bg-gold/20 text-gold-foreground">Winner</span>}
-                        </td>
-                        <td className="px-4 py-3 text-success font-medium">₹{r.t}</td>
-                        <td className="px-4 py-3 text-info">{r.d}</td>
-                        <td className="px-4 py-3">{r.p}</td>
-                        <td className="px-4 py-3 font-semibold">{r.s}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            {[
+              { icon: Trophy, title: "Recommendation or inconclusive result", description: "The model may abstain when quotation evidence is incomplete or does not support a reliable winner." },
+              { icon: BarChart3, title: "Vendor-by-vendor reasoning", description: "Compare cost, delivery and payment terms with advantages, disadvantages and risks." },
+              { icon: Shield, title: "Evidence and uncertainty", description: "See extracted values, missing information, extraction warnings and confidence limitations." },
+            ].map((item) => (
+              <div key={item.title} className="rounded-2xl p-6 bg-card border shadow-card">
+                <item.icon className="h-8 w-8 text-primary mb-4" />
+                <h3 className="font-semibold text-lg mb-2">{item.title}</h3>
+                <p className="text-sm text-muted-foreground">{item.description}</p>
               </div>
-            </div>
-            <div className="rounded-2xl p-6 gradient-primary text-primary-foreground shadow-elevated">
-              <Trophy className="h-8 w-8 mb-3" />
-              <div className="text-sm uppercase tracking-wider opacity-80">Recommended</div>
-              <div className="text-2xl font-bold mt-1">Acme Industrial</div>
-              <div className="text-sm opacity-90 mt-3">
-                Lowest total cost after credit-cost adjustment, delivery only 2 days slower than the fastest, and 45-day payment terms boost cash flow.
-              </div>
-              <div className="mt-6 grid grid-cols-3 gap-2 text-center">
-                {[{l:"Score",v:"94%"},{l:"Rank",v:"#1"},{l:"Save",v:"₹14k"}].map((x) => (
-                  <div key={x.l} className="bg-white/10 rounded-xl py-2">
-                    <div className="text-lg font-bold">{x.v}</div>
-                    <div className="text-[10px] uppercase opacity-80">{x.l}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            ))}
           </div>
         </div>
       </section>
@@ -194,8 +148,8 @@ const Landing = () => {
       <section className="py-20">
         <div className="container grid md:grid-cols-3 gap-6">
           {[
-            { i: Shield, t: "Local-first", d: "Files are processed in-browser by default." },
-            { i: Clock, t: "Auditable", d: "Every score has a transparent formula behind it." },
+            { i: Shield, t: "Local-first", d: "The backend sends structured quotation data to your local Ollama service." },
+            { i: Clock, t: "Auditable", d: "Displayed numeric values come from extracted fields and deterministic calculations." },
             { i: CheckCircle2, t: "Decision-ready", d: "Plain-English explanations for every recommendation." },
           ].map((x) => (
             <div key={x.t} className="rounded-2xl p-6 border bg-card shadow-card flex gap-4">

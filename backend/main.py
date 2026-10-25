@@ -9,17 +9,24 @@ from sqlalchemy.orm import Session
 from backend import models, schemas, crud
 from backend.database import SessionLocal, engine, Base
 from backend.migrations import ensure_analysis_columns, ensure_uploaded_files_columns
-from typing import Any, List, Optional
+from typing import Any, List
 import datetime
 import hashlib
+import logging
+import math
+import pandas as pd
 
-from core.comparison import build_comparison
-from core.cost_engine import CostConfig, compute_total_landed_cost
+from core.ai_evaluation import (
+    OllamaEvaluationError,
+    evaluate_vendors,
+    extract_constraints,
+    vendor_evaluation_dict,
+)
 from core.extraction import extract_fields
 from core.history import init_db, save_session
 from core.ingestion import ingest_bytes
 from core.normalization import normalize
-from core.scoring import compute_scores
+from core.quotation import to_quotation_evidence
 from utils.xlsx_writer import df_to_xlsx_bytes
 
 Base.metadata.create_all(bind=engine)
@@ -73,59 +80,20 @@ def read_analysis(db: Session = Depends(get_db)):
 
 APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DB_PATH = os.path.join(APP_ROOT, "data", "outputs", "history.db")
-
-
-def _to_float(value: Any, default: float) -> float:
-    try:
-        if value is None or value == "":
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _to_int(value: Any, default: int) -> int:
-    try:
-        if value is None or value == "":
-            return int(default)
-        return int(float(value))
-    except Exception:
-        return int(default)
-
-
-def _build_explanation_points(best_vendor: dict[str, Any], all_vendors: list[dict[str, Any]]) -> list[str]:
-    others = [v for v in all_vendors if v.get("id") != best_vendor.get("id")]
-    avg_cost = sum(float(v.get("total_cost", 0.0) or 0.0) for v in others) / max(1, len(others))
-    avg_delivery = sum(float(v.get("delivery_days", 0.0) or 0.0) for v in others) / max(1, len(others))
-
-    cost_saving = avg_cost - float(best_vendor.get("total_cost", 0.0) or 0.0)
-    delivery_gain = avg_delivery - float(best_vendor.get("delivery_days", 0.0) or 0.0)
-
-    points: list[str] = []
-    points.append(
-        f"{best_vendor.get('vendor_name', 'Best vendor')} achieves the highest weighted score of "
-        f"{(float(best_vendor.get('final_score', 0.0) or 0.0) * 100):.1f}%, driven by a strong cost-to-quality balance."
-    )
-    if cost_saving > 0:
-        points.append(f"Total cost is ₹{int(round(cost_saving)):,} lower than the average competitor.")
-    if delivery_gain > 0:
-        points.append(f"Delivery is {delivery_gain:.1f} days faster than the field average.")
-    payment_days = int(best_vendor.get("payment_days", 0) or 0)
-    if payment_days > 0:
-        points.append(f"Payment terms of Net {payment_days} provide healthy working-capital flexibility.")
-    credit_cost = float(best_vendor.get("credit_cost", 0.0) or 0.0)
-    points.append(
-        f"GST and freight are normalized; the credit-cost adjustment of ₹{int(round(credit_cost)):,} is included in the total."
-    )
-    return points
+logger = logging.getLogger(__name__)
 
 
 def _analysis_from_uploads(
     files: list[UploadFile],
-    cfg: CostConfig,
     usd_to_inr: float,
+    requirements: str,
     compute_output_files_meta: bool = False,
 ) -> dict[str, Any]:
+    if not math.isfinite(float(usd_to_inr)) or float(usd_to_inr) <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="USD-to-INR conversion rate must be a finite positive number.",
+        )
     extracted: list[dict[str, Any]] = []
     file_meta: list[dict[str, Any]] = []
     file_errors: list[dict[str, Any]] = []
@@ -137,13 +105,28 @@ def _analysis_from_uploads(
             if not b:
                 raise ValueError("Empty file")
 
+            logger.info(
+                "Received quotation filename=%s size_bytes=%s content_type=%s",
+                filename,
+                len(b),
+                f.content_type or "unknown",
+            )
             raw_text = ingest_bytes(b, filename)
             fields = extract_fields(raw_text, filename=filename)
             norm = normalize(fields, usd_to_inr=float(usd_to_inr))
 
-            costed, _breakdown = compute_total_landed_cost(norm, cfg=cfg)
-            costed["source_file"] = filename
-            extracted.append(costed)
+            norm["source_file"] = filename
+            extracted.append(norm)
+            logger.info(
+                "Quotation parsed filename=%s present_fields=%s missing_fields=%s warning_count=%s",
+                filename,
+                sorted(
+                    key for key, value in fields.items()
+                    if value is not None and key not in {"extraction_evidence", "missing_fields"}
+                ),
+                norm.get("missing_fields", []),
+                len(norm.get("data_warnings", [])),
+            )
 
             file_meta.append(
                 {
@@ -154,6 +137,7 @@ def _analysis_from_uploads(
                 }
             )
         except Exception as e:
+            logger.exception("Quotation processing failed for %s: %s", filename, e)
             file_errors.append({"name": filename, "error": str(e)})
             continue
 
@@ -167,65 +151,46 @@ def _analysis_from_uploads(
             },
         )
 
-    scored = compute_scores(extracted)
-
-    # Sort + rank for UI
-    scored_sorted = sorted(scored, key=lambda v: float(v.get("final_score", 0.0) or 0.0), reverse=True)
-    for i, v in enumerate(scored_sorted, start=1):
-        v["rank"] = i
-
-    # Convert into the UI's expected shape
-    ui_vendors: list[dict[str, Any]] = []
-    for v in scored_sorted:
-        vendor_name = str(v.get("vendor_name") or "Vendor").strip()
-        source_file = str(v.get("source_file") or "")
-        vid = f"{source_file or vendor_name}-{int(v.get('rank') or 0)}"
-
-        ui_vendors.append(
-            {
-                "id": vid,
-                "vendor_name": vendor_name,
-                "item_name": str(v.get("item_name") or "Item"),
-                "quantity": _to_int(v.get("quantity"), 1),
-                "unit_price": _to_float(v.get("unit_price"), 0.0),
-                "base_amount": _to_float(v.get("base_cost", v.get("total_price")), 0.0),
-                "gst_pct": _to_float(v.get("gst_percent"), 18.0),
-                "gst_amount": _to_float(v.get("gst_amount"), 0.0),
-                "freight": _to_float(v.get("freight_cost"), 0.0),
-                "delivery_days": _to_int(v.get("delivery_days"), 30),
-                "payment_days": _to_int(v.get("payment_days", v.get("payment_terms_days")), 30),
-                "credit_cost": _to_float(v.get("credit_cost"), 0.0),
-                "delay_penalty_cost": _to_float(v.get("delay_penalty_cost"), 0.0),
-                "missing_data_risk_cost": _to_float(v.get("missing_data_risk_cost"), 0.0),
-                "total_cost": _to_float(v.get("total_cost"), 0.0),
-                "currency": "INR",
-                "source_file": source_file,
-                "cost_score": _to_float(v.get("cost_score"), 0.0) / 100.0,
-                "delivery_score": _to_float(v.get("delivery_score"), 0.0) / 100.0,
-                "terms_score": _to_float(v.get("terms_score"), 0.0) / 100.0,
-                "final_score": _to_float(v.get("final_score"), 0.0) / 100.0,
-                "rank": _to_int(v.get("rank"), 0),
-            }
-        )
-
-    # Differences vs best-in-class (UI expects)
-    min_cost = min(float(v.get("total_cost") or 0.0) for v in ui_vendors)
-    min_delivery = min(int(v.get("delivery_days") or 0) for v in ui_vendors)
-    max_payment = max(int(v.get("payment_days") or 0) for v in ui_vendors)
-    differences = [
-        {
-            "vendor_name": v["vendor_name"],
-            "cost_diff": float(v["total_cost"]) - min_cost,
-            "delivery_diff": int(v["delivery_days"]) - min_delivery,
-            "terms_diff": max_payment - int(v["payment_days"]),
-        }
-        for v in ui_vendors
+    quotes = [
+        to_quotation_evidence(vendor, f"vendor-{index}")
+        for index, vendor in enumerate(extracted, start=1)
     ]
-
-    best = ui_vendors[0]
-
-    # Keep the original comparison DataFrame available for history/audit
-    comparison_df, best_vendor_name = build_comparison(scored_sorted)
+    evaluation, constraint_warnings = evaluate_vendors(quotes, requirements)
+    vendor_by_id = {quote["vendor_id"]: quote for quote in quotes}
+    evaluation_by_id = {item.vendor_id: vendor_evaluation_dict(item) for item in evaluation.ranked_vendors}
+    ui_vendors = [
+        {
+            **vendor_by_id[item.vendor_id],
+            **evaluation_by_id[item.vendor_id],
+            "id": item.vendor_id,
+        }
+        for item in evaluation.ranked_vendors
+    ]
+    best_id = evaluation.best_recommendation_vendor_id
+    best = next((vendor for vendor in ui_vendors if vendor["id"] == best_id), None)
+    alternative = next(
+        (vendor for vendor in ui_vendors if vendor["id"] == evaluation.alternative_vendor_id),
+        None,
+    )
+    comparison_df = pd.DataFrame(
+        [
+            {
+                "rank": vendor["rank"],
+                "vendor_name": vendor["vendor_name"],
+                "total_cost": vendor["total_cost"],
+                "delivery_days": vendor["delivery_days"],
+                "payment_days": vendor["payment_days"],
+                "recommendation_status": vendor["recommendation_status"],
+                "explanation": vendor["explanation"],
+            }
+            for vendor in ui_vendors
+        ]
+    )
+    best_vendor_name = (
+        best["vendor_name"] or "Vendor name not extracted"
+        if best
+        else "Inconclusive"
+    )
 
     output_files_meta: list[dict[str, Any]] = []
     if compute_output_files_meta:
@@ -251,15 +216,21 @@ def _analysis_from_uploads(
         "createdAt": created_at_ms,
         "vendors": ui_vendors,
         "best": best,
-        "explanation": _build_explanation_points(best, ui_vendors),
-        "differences": differences,
+        "alternative": alternative,
+        "inconclusive": evaluation.inconclusive,
+        "evaluation_summary": evaluation.overall_explanation,
+        "requirements": requirements,
+        "constraints": extract_constraints(requirements),
+        "constraint_warnings": constraint_warnings,
+        "explanation": [evaluation.overall_explanation],
+        "differences": [],
         "files": file_meta,
         "output_files": output_files_meta,
         "file_errors": file_errors,
         "audit": {
             "best_vendor": best_vendor_name,
             "comparison": comparison_df.to_dict(orient="records"),
-            "vendors_raw": scored_sorted,
+            "vendors_raw": quotes,
         },
     }
     return result
@@ -283,6 +254,7 @@ def health() -> dict[str, str]:
 @app.post("/api/analyze")
 def analyze(
     files: list[UploadFile] = File(...),
+    requirements: str = Form("", max_length=2000),
     usd_to_inr: float = Form(83.0),
     interest_rate_pct: float = Form(12.0),
     baseline_payment_days: int = Form(30),
@@ -294,28 +266,26 @@ def analyze(
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded.")
 
-    cfg = CostConfig(
-        usd_to_inr=float(usd_to_inr),
-        interest_rate=float(interest_rate_pct) / 100.0,
-        baseline_payment_days=int(baseline_payment_days),
-        sla_delivery_days=int(sla_delivery_days),
-        delay_penalty_rate_per_day=float(delay_penalty_rate_per_day_pct) / 100.0,
-        delay_penalty_cap_pct=float(delay_penalty_cap_pct) / 100.0,
-    )
-
     init_db(DB_PATH)
-    result = _analysis_from_uploads(
-        files=files,
-        cfg=cfg,
-        usd_to_inr=float(usd_to_inr),
-        compute_output_files_meta=bool(save_history_flag),
-    )
+    try:
+        result = _analysis_from_uploads(
+            files=files,
+            usd_to_inr=float(usd_to_inr),
+            requirements=requirements,
+            compute_output_files_meta=bool(save_history_flag),
+        )
+    except OllamaEvaluationError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
     if save_history_flag:
         vendors = result.get("vendors") or []
-        best_vendor = (result.get("best") or {}).get("vendor_name") or "N/A"
-        final_score = float((result.get("best") or {}).get("final_score") or 0.0) * 100.0
+        best_vendor = (
+            (result.get("best") or {}).get("vendor_name")
+            or ((result.get("best") or {}).get("id") if result.get("best") else None)
+            or "Inconclusive"
+        )
+        final_score = 0.0
         save_session(
             DB_PATH,
             vendor_count=len(vendors),
@@ -338,6 +308,12 @@ def analyze(
                 "createdAt": result.get("createdAt"),
                 "vendors": result.get("vendors"),
                 "best": result.get("best"),
+                "alternative": result.get("alternative"),
+                "inconclusive": result.get("inconclusive"),
+                "evaluation_summary": result.get("evaluation_summary"),
+                "requirements": result.get("requirements"),
+                "constraints": result.get("constraints"),
+                "constraint_warnings": result.get("constraint_warnings"),
                 "explanation": result.get("explanation"),
                 "differences": result.get("differences"),
                 "files": result.get("files"),
@@ -348,6 +324,8 @@ def analyze(
                 "files": result.get("files"),
                 "vendors_raw": audit.get("vendors_raw"),
                 "comparison": audit.get("comparison"),
+                "requirements": result.get("requirements"),
+                "constraints": result.get("constraints"),
             }
 
             analysis_obj = schemas.AnalysisCreate(
@@ -386,10 +364,9 @@ def analyze(
                         ),
                     )
             except Exception as e:
-                # Do not fail the analysis response if Postgres persistence fails.
-                # Frontend has a backend-fallback path; raising here would cause it to silently switch.
+                # SQLite history is already saved; preserve the result if PostgreSQL persistence fails.
                 db.rollback()
-                print(f"[warn] Postgres save failed: {e}")
+                logger.warning("PostgreSQL analysis persistence failed: %s", e)
         finally:
             db.close()
 
@@ -400,8 +377,14 @@ def analyze(
         "createdAt": result["createdAt"],
         "vendors": result["vendors"],
         "best": result["best"],
+        "alternative": result["alternative"],
+        "inconclusive": result["inconclusive"],
+        "evaluation_summary": result["evaluation_summary"],
+        "requirements": result["requirements"],
+        "constraints": result["constraints"],
+        "constraint_warnings": result["constraint_warnings"],
         "explanation": result["explanation"],
         "differences": result["differences"],
         "files": result["files"],
+        "file_errors": result["file_errors"],
     }
-

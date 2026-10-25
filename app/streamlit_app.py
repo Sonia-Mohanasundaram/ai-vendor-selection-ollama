@@ -1,486 +1,343 @@
-"""
-Streamlit UI: AI Vendor Comparison System (CPU-only, rule-based).
-
-Run:
-    streamlit run app/streamlit_app.py
-"""
+"""Streamlit interface for Ollama-powered quotation evaluation."""
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import sys
-from typing import Any, Dict, List
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-# Make project root importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.ingestion import ingest_bytes, preview_file
+from core.ai_evaluation import (
+    OllamaEvaluationError,
+    evaluate_vendors,
+    extract_constraints,
+    vendor_evaluation_dict,
+)
 from core.extraction import extract_fields
+from core.history import clear_history, get_session, init_db, list_sessions, save_session
+from core.ingestion import ingest_bytes, preview_file
 from core.normalization import normalize
-from core.cost_engine import compute_total_landed_cost, CostConfig
-from core.scoring import compute_scores
-from core.comparison import build_comparison
-from core.explanation import generate_explanation, build_why_table
-from core.history import init_db, list_sessions, get_session, save_session, clear_history
+from core.quotation import to_quotation_evidence
 from utils.xlsx_writer import df_to_xlsx_bytes
 
 
 st.set_page_config(page_title="AI Vendor Comparison System", layout="wide")
 st.title("AI Vendor Comparison System")
-
 st.write(
-    "Upload vendor quotations (PDF, images, CSV, XLSX). "
-    "The system extracts key fields, normalizes values, compares vendors, scores them, "
-    "and recommends the best option using rule-based logic (no LLMs)."
+    "Upload vendor quotations and let a local Ollama model compare the extracted evidence "
+    "against your purchase priorities. No paid AI API is used."
+)
+usd_to_inr = st.sidebar.number_input(
+    "USD → INR conversion rate", min_value=1.0, max_value=500.0, value=83.0, step=0.5
 )
 
 uploaded_files = st.file_uploader(
     "Upload quotation files",
-    type=["pdf", "png", "jpg", "jpeg", "csv", "xlsx"],
+    type=["pdf", "docx", "png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif", "csv", "xlsx"],
     accept_multiple_files=True,
 )
-
-file_count = len(uploaded_files) if uploaded_files else 0
-if uploaded_files and (file_count < 3 or file_count > 10):
-    st.warning("Upload between 3 and 10 vendor files for a realistic comparison.")
-
+requirements = st.text_area(
+    "Purchase priorities and mandatory constraints",
+    placeholder="For example: prioritize delivery within 10 days; maximum budget ₹2,00,000.",
+    max_chars=2000,
+)
+file_count = len(uploaded_files or [])
 analyze = st.button(
-    "Analyze Quotations",
+    "Evaluate with Ollama",
     type="primary",
     use_container_width=True,
-    disabled=not uploaded_files or file_count > 10 or file_count < 3,
+    disabled=file_count < 2 or file_count > 10,
 )
+if uploaded_files and file_count < 2:
+    st.info("Upload at least 2 quotation files to compare.")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "outputs", "history.db")
 init_db(DB_PATH)
-
 st.sidebar.title("📜 History")
 sessions = list_sessions(DB_PATH, limit=100)
 session_labels = {
-    s["id"]: f'Analysis {s["id"]} — {s["vendor_count"]} vendors — {s["best_vendor"]} ({s["final_score"]:.1f}) — {str(s["timestamp"])[:10]}'
-    for s in sessions
+    session["id"]: (
+        f'Analysis {session["id"]} — {session["vendor_count"]} vendors — '
+        f'{session["best_vendor"]} — {str(session["timestamp"])[:10]}'
+    )
+    for session in sessions
 }
 selected = st.sidebar.radio(
     "Previous analyses",
-    options=["New analysis"] + [s["id"] for s in sessions],
-    format_func=lambda x: x if x == "New analysis" else session_labels.get(x, f"Analysis {x}"),
+    options=["New analysis"] + [session["id"] for session in sessions],
+    format_func=lambda value: value if value == "New analysis" else session_labels.get(value, f"Analysis {value}"),
 )
-
 if st.sidebar.button("Clear History", use_container_width=True):
     clear_history(DB_PATH)
     st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Assumptions")
-usd_to_inr = st.sidebar.number_input("USD → INR rate", min_value=1.0, max_value=500.0, value=83.0, step=0.5)
-interest_rate_pct = st.sidebar.slider("Interest rate (p.a.) %", 0.0, 30.0, 12.0, 0.5)
-baseline_payment_days = st.sidebar.slider("Baseline payment days", 0, 120, 30, 1)
-sla_delivery_days = st.sidebar.slider("SLA delivery days", 1, 120, 14, 1)
-delay_penalty_rate_per_day_pct = st.sidebar.slider("Delay risk / day %", 0.0, 1.0, 0.10, 0.05)
-delay_penalty_cap_pct = st.sidebar.slider("Delay risk cap %", 0.0, 20.0, 5.0, 0.5)
-st.sidebar.caption(
-    "Delay risk is a *cost* added when delivery exceeds SLA (capped). "
-    "Credit cost is added when payment terms are shorter than baseline."
-)
 
-cost_cfg = CostConfig(
-    usd_to_inr=float(usd_to_inr),
-    interest_rate=float(interest_rate_pct) / 100.0,
-    baseline_payment_days=int(baseline_payment_days),
-    sla_delivery_days=int(sla_delivery_days),
-    delay_penalty_rate_per_day=float(delay_penalty_rate_per_day_pct) / 100.0,
-    delay_penalty_cap_pct=float(delay_penalty_cap_pct) / 100.0,
-)
+def _render_results(results: dict[str, Any]) -> None:
+    if results.get("inconclusive"):
+        st.warning("No verified winner. Review the limitations and missing evidence below.")
+    elif results.get("best_vendor"):
+        st.success(f"Recommended vendor: {results['best_vendor']}")
 
-def _style_comparison(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    df2 = df.copy()
-    for col in ["total_cost", "delivery_days", "payment_days", "final_score"]:
-        df2[col] = pd.to_numeric(df2[col], errors="coerce")
+    st.write(results.get("evaluation_summary", ""))
+    for warning in results.get("constraint_warnings", []):
+        st.warning(warning)
+    if results.get("requirements"):
+        st.caption(f"Requirements: {results['requirements']}")
+    constraints = results.get("constraints") or {}
+    enforced = []
+    if constraints.get("max_budget_inr") is not None:
+        enforced.append(f"Maximum budget ₹{constraints['max_budget_inr']:,.2f}")
+    if constraints.get("max_delivery_days") is not None:
+        enforced.append(f"Delivery within {constraints['max_delivery_days']:g} days")
+    if enforced:
+        st.info("Hard constraints checked: " + "; ".join(enforced))
 
-    min_cost = df2["total_cost"].min()
-    min_delivery = df2["delivery_days"].min()
-    max_score = df2["final_score"].max()
-
-    def highlight(row: pd.Series):
-        styles = [""] * len(row)
-        cols = list(row.index)
-
-        def set_style(col_name: str, style: str):
-            if col_name in cols:
-                styles[cols.index(col_name)] = style
-
-        if pd.notna(row.get("total_cost")) and row["total_cost"] == min_cost:
-            set_style("total_cost", "background-color: #DCFCE7;")  # green
-        if pd.notna(row.get("delivery_days")) and row["delivery_days"] == min_delivery:
-            set_style("delivery_days", "background-color: #DBEAFE;")  # blue
-        if pd.notna(row.get("final_score")) and row["final_score"] == max_score:
-            set_style("final_score", "background-color: #FEF3C7;")  # gold
-
-        return styles
-
-    return (
-        df2.style.apply(highlight, axis=1)
-        .format(
+    vendors = results.get("vendors", [])
+    comparison = pd.DataFrame(
+        [
             {
-                "total_cost": "Rs.{:,.2f}",
-                "delivery_days": "{:.0f}",
-                "payment_days": "{:.0f}",
-                "cost_score": "{:.2f}",
-                "delivery_score": "{:.2f}",
-                "terms_score": "{:.2f}",
-                "final_score": "{:.2f}",
+                "Rank": vendor["rank"],
+                "Vendor": vendor["vendor_name"] or "Vendor name not extracted",
+                "Recommendation": vendor["recommendation_status"].replace("_", " "),
+                "Total cost (INR)": vendor.get("total_cost"),
+                "Delivery days": vendor.get("delivery_days"),
+                "Payment days": vendor.get("payment_days"),
             }
-        )
+            for vendor in vendors
+        ]
     )
+    if not comparison.empty:
+        st.subheader("AI-ranked comparison")
+        st.dataframe(comparison, use_container_width=True, hide_index=True)
 
+    if results.get("alternative_vendor"):
+        st.info(f"Alternative to consider: {results['alternative_vendor'] or 'Vendor name not extracted'}")
 
-def _cost_breakdown_df(breakdowns: List[Dict[str, float]]) -> pd.DataFrame:
-    if not breakdowns:
-        return pd.DataFrame()
-    df = pd.DataFrame(breakdowns)
-    cols = [
-        "vendor_name",
-        "base_cost",
-        "gst_amount",
-        "freight_cost",
-        "credit_cost",
-        "delay_penalty_cost",
-        "missing_data_risk_cost",
-        "total_cost",
-    ]
-    cols = [c for c in cols if c in df.columns]
-    return df[cols]
+    st.subheader("Vendor evaluations")
+    for vendor in vendors:
+        vendor_name = vendor.get("vendor_name") or "Vendor name not extracted"
+        with st.expander(f"#{vendor['rank']} {vendor_name} — {vendor['recommendation_status'].replace('_', ' ')}"):
+            st.markdown(f"**Reasoning:** {vendor['explanation']}")
+            st.markdown(
+                f"**Extracted cost fields (INR):** Base {vendor.get('base_amount')}; "
+                f"GST {vendor.get('gst_percent')}% / {vendor.get('gst_amount')}; "
+                f"freight {vendor.get('freight')}; other taxes {vendor.get('other_taxes')}; "
+                f"additional charges {vendor.get('additional_charges')}."
+            )
+            st.markdown(
+                f"**Cost:** {vendor['cost_comparison']}  \n"
+                f"**Delivery:** {vendor['delivery_comparison']}  \n"
+                f"**Payment terms:** {vendor['payment_terms_comparison']}"
+            )
+            st.markdown("**Advantages**")
+            st.write(vendor.get("advantages") or ["None identified"])
+            st.markdown("**Disadvantages**")
+            st.write(vendor.get("disadvantages") or ["None identified"])
+            st.markdown("**Risks**")
+            st.write(vendor.get("risks") or ["None identified"])
+            st.markdown("**Extraction / consistency warnings**")
+            st.write(vendor.get("data_warnings") or ["None identified"])
+            missing = list(dict.fromkeys(
+                (vendor.get("missing_information") or []) + (vendor.get("missing_fields") or [])
+            ))
+            st.markdown("**Missing information**")
+            st.write(missing or ["None identified"])
+            st.caption(f"Confidence / uncertainty: {vendor['confidence_explanation']}")
 
-
-def _render_file_previews(files: List[Any]) -> None:
-    if not files:
-        return
-    st.subheader("File preview")
-    st.caption("Preview is for verification; extraction uses the full document text/OCR.")
-    for f in files:
-        name = f.name
-        b = f.getvalue()
-        info = preview_file(b, name)
-        with st.expander(name, expanded=False):
-            if info["type"] == "pdf":
-                import fitz
-
-                try:
-                    doc = fitz.open(stream=b, filetype="pdf")
-                    page_count = min(2, doc.page_count)
-                    for p in range(page_count):
-                        page = doc[p]
-                        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                        st.image(pix.tobytes("png"), caption=f"Page {p+1}", use_container_width=True)
-                    doc.close()
-                except Exception as e:
-                    st.write(f"PDF preview failed: {e}")
-            elif info["type"] == "image":
-                st.image(b, caption=name, use_container_width=True)
-            elif info["type"] == "table":
-                st.dataframe(info["df"], use_container_width=True)
-            else:
-                st.write("No preview available for this file type.")
-
-
-def _render_results(results: Dict[str, Any]) -> None:
-    comparison_df = pd.DataFrame(results.get("comparison", []))
-    best_vendor = results.get("best_vendor", "N/A")
-    explanation = results.get("explanation", "")
-    why_df = pd.DataFrame(results.get("why_table", []))
-    breakdown_df = pd.DataFrame(results.get("cost_breakdown", []))
-    vendors = results.get("vendors") or []
-
-    st.subheader("Comparison")
-    st.caption("Highlights: lowest cost (green), fastest delivery (blue), best score (gold).")
-    if not comparison_df.empty:
-        st.dataframe(_style_comparison(comparison_df), use_container_width=True)
-
-    st.subheader("Ranking per metric")
-    ranks = comparison_df.copy()
-    if not ranks.empty:
-        ranks["cost_rank"] = ranks["total_cost"].rank(method="min", ascending=True).astype(int)
-        ranks["delivery_rank"] = ranks["delivery_days"].rank(method="min", ascending=True).astype(int)
-        ranks["terms_rank"] = ranks["payment_days"].rank(method="min", ascending=False).astype(int)
-        ranks["overall_rank"] = ranks["final_score"].rank(method="min", ascending=False).astype(int)
-        st.dataframe(
-            ranks[["vendor_name", "cost_rank", "delivery_rank", "terms_rank", "overall_rank"]]
-            .sort_values("overall_rank")
-            .reset_index(drop=True),
-            use_container_width=True,
-        )
-
-    st.subheader("Recommended Vendor")
-    st.success(best_vendor)
-    st.write(explanation)
-
-    st.subheader("Why this vendor is best")
-    if not why_df.empty:
-        st.dataframe(
-            why_df.style.format(
+    if vendors:
+        report = pd.DataFrame(
+            [
                 {
-                    "total_cost": "Rs.{:,.0f}",
-                    "delivery_days": "{:.0f}",
-                    "payment_days": "{:.0f}",
-                    "final_score": "{:.2f}",
-                    "cost_diff_vs_best": "Rs.{:+,.0f}",
-                    "delivery_diff_vs_best": "{:+.0f} d",
-                    "terms_diff_vs_best": "{:+.0f} d",
-                    "score_diff_vs_best": "{:+.2f}",
+                    "Rank": vendor["rank"],
+                    "Vendor": vendor.get("vendor_name") or "Vendor name not extracted",
+                    "Recommendation": vendor["recommendation_status"],
+                    "Total cost (INR)": vendor.get("total_cost"),
+                    "Base amount (INR)": vendor.get("base_amount"),
+                    "GST %": vendor.get("gst_percent"),
+                    "GST amount (INR)": vendor.get("gst_amount"),
+                    "Freight (INR)": vendor.get("freight"),
+                    "Other taxes (INR)": vendor.get("other_taxes"),
+                    "Additional charges (INR)": vendor.get("additional_charges"),
+                    "Delivery days": vendor.get("delivery_days"),
+                    "Payment days": vendor.get("payment_days"),
+                    "Reasoning": vendor["explanation"],
+                    "Risks": "; ".join(vendor.get("risks") or []),
+                    "Missing information": "; ".join(missing for missing in (
+                        vendor.get("missing_information") or []
+                    ) + (vendor.get("missing_fields") or [])),
+                    "Confidence": vendor["confidence_explanation"],
+                    "Extraction warnings": "; ".join(vendor.get("data_warnings") or []),
                 }
-            ),
-            use_container_width=True,
+                for vendor in vendors
+            ]
         )
-
-    st.subheader("Hidden cost breakdown (landed cost)")
-    if not breakdown_df.empty:
-        st.dataframe(
-            breakdown_df.style.format(
-                {
-                    "base_cost": "Rs.{:,.0f}",
-                    "gst_amount": "Rs.{:,.0f}",
-                    "freight_cost": "Rs.{:,.0f}",
-                    "credit_cost": "Rs.{:,.0f}",
-                    "delay_penalty_cost": "Rs.{:,.0f}",
-                    "missing_data_risk_cost": "Rs.{:,.0f}",
-                    "total_cost": "Rs.{:,.0f}",
-                }
-            ),
-            use_container_width=True,
-        )
-
-    st.subheader("Export")
-    if not comparison_df.empty:
+        st.subheader("Export")
         st.download_button(
             "Download CSV report",
-            data=comparison_df.to_csv(index=False).encode("utf-8"),
-            file_name="vendor_comparison_report.csv",
+            data=report.to_csv(index=False).encode("utf-8"),
+            file_name="vendor_evaluation_report.csv",
             mime="text/csv",
             use_container_width=True,
         )
         st.download_button(
             "Download Excel report (.xlsx)",
-            data=df_to_xlsx_bytes(comparison_df, sheet_name="Vendor Comparison"),
-            file_name="vendor_comparison_report.xlsx",
+            data=df_to_xlsx_bytes(report, sheet_name="AI Evaluation"),
+            file_name="vendor_evaluation_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
-
-    if vendors:
-        with st.expander("Audit trail (saved)"):
-            for v in vendors:
-                st.markdown(f"**{v.get('vendor_name', 'Unknown Vendor')}**")
-                st.json(v)
+        with st.expander("Audit trail (extracted evidence)"):
+            for vendor in vendors:
+                st.markdown(f"**{vendor.get('vendor_name') or 'Vendor name not extracted'}**")
+                st.json(vendor)
 
 
 if analyze and uploaded_files:
-    with st.spinner("Analyzing quotations..."):
-        extracted: List[Dict[str, Any]] = []
+    with st.spinner("Extracting quotations and evaluating with Ollama..."):
+        extracted: list[dict[str, Any]] = []
+        file_names = [file.name for file in uploaded_files]
+        uploaded_files_meta: list[dict[str, Any]] = []
         errors: list[str] = []
-        cost_breakdowns: List[Dict[str, float]] = []
-        file_names: List[str] = [f.name for f in uploaded_files]
-        uploaded_files_meta: List[Dict[str, Any]] = []
-
-        prog = st.progress(0, text="Processing files...")
-        total = len(uploaded_files)
-
-        for i, f in enumerate(uploaded_files, start=1):
+        progress = st.progress(0, text="Processing quotations...")
+        for index, file in enumerate(uploaded_files, start=1):
             try:
-                b = f.getvalue()
+                contents = file.getvalue()
+                raw_text = ingest_bytes(contents, file.name)
+                fields = extract_fields(raw_text, filename=file.name)
+                normalized = normalize(fields, usd_to_inr=float(usd_to_inr))
+                normalized["source_file"] = file.name
+                extracted.append(normalized)
                 uploaded_files_meta.append(
                     {
-                        "name": f.name,
-                        "size": len(b),
-                        "type": getattr(f, "type", "") or "",
-                        "sha256": hashlib.sha256(b).hexdigest(),
+                        "name": file.name,
+                        "size": len(contents),
+                        "type": getattr(file, "type", "") or "",
+                        "sha256": hashlib.sha256(contents).hexdigest(),
                     }
                 )
-                raw_text = ingest_bytes(b, f.name)
-                fields = extract_fields(raw_text, filename=f.name)
-                norm = normalize(fields, usd_to_inr=float(usd_to_inr))
-                costed, breakdown = compute_total_landed_cost(norm, cfg=cost_cfg)
-                extracted.append(costed)
+            except Exception as exc:
+                errors.append(f"{file.name}: {exc}")
+            progress.progress(int(index * 100 / len(uploaded_files)), text=f"Processed {index}/{len(uploaded_files)}")
 
-                breakdown_row = dict(breakdown)
-                breakdown_row["vendor_name"] = costed.get("vendor_name", f.name)
-                cost_breakdowns.append(breakdown_row)
-            except Exception as e:
-                errors.append(f"{f.name}: {e}")
+        for error in errors:
+            st.warning(error)
 
-            prog.progress(int(i * 100 / max(1, total)), text=f"Processed {i}/{total}")
-
-        if errors:
-            st.warning("Some files could not be processed:")
-            for msg in errors:
-                st.write(f"- {msg}")
-
-        if not extracted:
-            st.error("No valid quotations were processed.")
+        if len(extracted) < 2:
+            st.error("At least 2 valid quotations are required for an AI evaluation.")
         else:
-            scored = compute_scores(extracted)
-            comparison_df, best_vendor = build_comparison(scored)
-            best_details = next((v for v in scored if v.get("vendor_name") == best_vendor), None)
-            explanation = generate_explanation(best_vendor, comparison_df, best_vendor_details=best_details)
-
-            st.subheader("Comparison")
-            st.caption("Highlights: lowest cost (green), fastest delivery (blue), best score (gold).")
-            st.dataframe(_style_comparison(comparison_df), use_container_width=True)
-
-            st.subheader("Ranking per metric")
-            ranks = comparison_df.copy()
-            ranks["cost_rank"] = ranks["total_cost"].rank(method="min", ascending=True).astype(int)
-            ranks["delivery_rank"] = ranks["delivery_days"].rank(method="min", ascending=True).astype(int)
-            ranks["terms_rank"] = ranks["payment_days"].rank(method="min", ascending=False).astype(int)
-            ranks["overall_rank"] = ranks["final_score"].rank(method="min", ascending=False).astype(int)
-            st.dataframe(
-                ranks[["vendor_name", "cost_rank", "delivery_rank", "terms_rank", "overall_rank"]]
-                .sort_values("overall_rank")
-                .reset_index(drop=True),
-                use_container_width=True,
-            )
-
-            st.subheader("Recommended Vendor")
-            st.success(best_vendor)
-            st.write(explanation)
-
-            st.subheader("Why this vendor is best")
-            why_df = build_why_table(comparison_df, best_vendor)
-            st.caption("Diff columns are relative to the recommended vendor (positive cost/delivery diffs are worse).")
-            st.dataframe(
-                why_df.style.format(
-                    {
-                        "total_cost": "Rs.{:,.0f}",
-                        "delivery_days": "{:.0f}",
-                        "payment_days": "{:.0f}",
-                        "final_score": "{:.2f}",
-                        "cost_diff_vs_best": "Rs.{:+,.0f}",
-                        "delivery_diff_vs_best": "{:+.0f} d",
-                        "terms_diff_vs_best": "{:+.0f} d",
-                        "score_diff_vs_best": "{:+.2f}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-            st.subheader("Hidden cost breakdown (landed cost)")
-            cb = _cost_breakdown_df(cost_breakdowns)
-            if not cb.empty:
-                st.dataframe(
-                    cb.style.format(
+            try:
+                quotes = [
+                    to_quotation_evidence(item, f"vendor-{index}")
+                    for index, item in enumerate(extracted, start=1)
+                ]
+                evaluation, constraint_warnings = evaluate_vendors(quotes, requirements)
+                by_id = {quote["vendor_id"]: quote for quote in quotes}
+                ranked = []
+                for item in evaluation.ranked_vendors:
+                    ranked.append(
                         {
-                            "base_cost": "Rs.{:,.0f}",
-                            "gst_amount": "Rs.{:,.0f}",
-                            "freight_cost": "Rs.{:,.0f}",
-                            "credit_cost": "Rs.{:,.0f}",
-                            "delay_penalty_cost": "Rs.{:,.0f}",
-                            "missing_data_risk_cost": "Rs.{:,.0f}",
-                            "total_cost": "Rs.{:,.0f}",
-                        }
-                    ),
-                    use_container_width=True,
-                )
-
-            st.subheader("Export")
-            csv_bytes = comparison_df.to_csv(index=False).encode("utf-8")
-            xlsx_bytes = df_to_xlsx_bytes(comparison_df, sheet_name="Vendor Comparison")
-            st.download_button(
-                "Download CSV report",
-                data=csv_bytes,
-                file_name="vendor_comparison_report.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.download_button(
-                "Download Excel report (.xlsx)",
-                data=xlsx_bytes,
-                file_name="vendor_comparison_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-            # Save session history
-            output_files_meta = [
-                {
-                    "name": "vendor_comparison_report.csv",
-                    "size": len(csv_bytes),
-                    "type": "text/csv",
-                },
-                {
-                    "name": "vendor_comparison_report.xlsx",
-                    "size": len(xlsx_bytes),
-                    "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                },
-            ]
-            results_payload = {
-                "comparison": comparison_df.to_dict(orient="records"),
-                "best_vendor": best_vendor,
-                "final_score": float(comparison_df.iloc[0]["final_score"]) if not comparison_df.empty else 0.0,
-                "explanation": explanation,
-                "why_table": why_df.to_dict(orient="records"),
-                "cost_breakdown": cb.to_dict(orient="records") if not cb.empty else [],
-                "vendors": scored,
-            }
-            save_session(
-                DB_PATH,
-                vendor_count=len(comparison_df),
-                best_vendor=best_vendor,
-                final_score=float(results_payload["final_score"]),
-                data=results_payload,
-                file_names=file_names,
-                uploaded_files=uploaded_files_meta,
-                output_files=output_files_meta,
-            )
-            st.info("Saved this analysis to History (sidebar).")
-
-            with st.expander("Audit trail (per vendor)"):
-                for v in scored:
-                    st.markdown(f"**{v.get('vendor_name', 'Unknown Vendor')}**")
-                    st.json(
-                        {
-                            "source_fields": {
-                                "delivery_text": v.get("delivery_text"),
-                                "payment_terms_text": v.get("payment_terms_text"),
-                                "penalty_clause": v.get("penalty_clause"),
-                            },
-                            "normalized_values": {
-                                "quantity": v.get("quantity"),
-                                "unit_price_inr": v.get("unit_price"),
-                                "base_cost_inr": v.get("base_cost"),
-                                "gst_percent": v.get("gst_percent"),
-                                "freight_cost_inr": v.get("freight_cost"),
-                                "delivery_days": v.get("delivery_days"),
-                                "payment_days": v.get("payment_days"),
-                            },
-                            "hidden_costs": {
-                                "gst_amount": v.get("gst_amount"),
-                                "credit_cost": v.get("credit_cost"),
-                                "delay_penalty_cost": v.get("delay_penalty_cost"),
-                                "missing_data_risk_cost": v.get("missing_data_risk_cost"),
-                                "total_cost_inr": v.get("total_cost"),
-                            },
-                            "scoring": {
-                                "cost_score": v.get("cost_score"),
-                                "delivery_score": v.get("delivery_score"),
-                                "terms_score": v.get("terms_score"),
-                                "final_score": v.get("final_score"),
-                            },
-                            "missing_fields": v.get("missing_fields"),
-                            "extraction_evidence": v.get("extraction_evidence"),
+                            **by_id[item.vendor_id],
+                            **vendor_evaluation_dict(item),
+                            "id": item.vendor_id,
                         }
                     )
+                best = next(
+                    (vendor for vendor in ranked if vendor["id"] == evaluation.best_recommendation_vendor_id),
+                    None,
+                )
+                alternative = next(
+                    (vendor for vendor in ranked if vendor["id"] == evaluation.alternative_vendor_id),
+                    None,
+                )
+                payload = {
+                    "vendors": ranked,
+                    "best_vendor": (
+                        (best.get("vendor_name") or "Vendor name not extracted") if best else "Inconclusive"
+                    ),
+                    "alternative_vendor": (
+                        (alternative.get("vendor_name") or "Vendor name not extracted")
+                        if alternative else None
+                    ),
+                    "inconclusive": evaluation.inconclusive,
+                    "evaluation_summary": evaluation.overall_explanation,
+                    "requirements": requirements,
+                    "constraints": extract_constraints(requirements),
+                    "constraint_warnings": constraint_warnings,
+                }
+                output = pd.DataFrame(
+                    [
+                        {
+                            "rank": vendor["rank"],
+                            "vendor_name": vendor["vendor_name"],
+                            "recommendation_status": vendor["recommendation_status"],
+                            "total_cost": vendor["total_cost"],
+                            "delivery_days": vendor["delivery_days"],
+                            "payment_days": vendor["payment_days"],
+                            "explanation": vendor["explanation"],
+                        }
+                        for vendor in ranked
+                    ]
+                )
+                csv_data = output.to_csv(index=False).encode("utf-8")
+                xlsx_data = df_to_xlsx_bytes(output, sheet_name="AI Evaluation")
+                output_files = [
+                    {"name": "vendor_evaluation_report.csv", "size": len(csv_data), "type": "text/csv"},
+                    {
+                        "name": "vendor_evaluation_report.xlsx",
+                        "size": len(xlsx_data),
+                        "type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    },
+                ]
+                results_payload = {**payload, "comparison": output.to_dict(orient="records")}
+                save_session(
+                    DB_PATH,
+                    vendor_count=len(ranked),
+                    best_vendor=payload["best_vendor"],
+                    final_score=0.0,
+                    data=results_payload,
+                    file_names=file_names,
+                    uploaded_files=uploaded_files_meta,
+                    output_files=output_files,
+                )
+                st.info("Saved this evaluation to History.")
+                _render_results(results_payload)
+            except OllamaEvaluationError as exc:
+                st.error(str(exc))
 
 elif selected != "New analysis":
     session = get_session(DB_PATH, int(selected))
     if session:
-        files = session.get("file_names") or []
-        file_str = ", ".join(files[:6]) + ("..." if len(files) > 6 else "")
-        st.caption(
-            f"Loaded from history — {session['timestamp']} (UTC), {session['vendor_count']} vendors. Files: {file_str}"
-        )
-        _render_results(session["data"])
+        st.caption(f"Loaded from history — {session['timestamp']} (UTC), {session['vendor_count']} vendors.")
+        if "evaluation_summary" not in session["data"]:
+            st.warning("This saved result used the previous rule-based scoring system.")
+        else:
+            _render_results(session["data"])
 
-_render_file_previews(uploaded_files or [])
+if uploaded_files:
+    st.subheader("File preview")
+    st.caption("Preview is for verification; extraction uses the full document text/OCR.")
+    for file in uploaded_files:
+        info = preview_file(file.getvalue(), file.name)
+        with st.expander(file.name, expanded=False):
+            if info["type"] == "pdf":
+                import fitz
+
+                try:
+                    document = fitz.open(stream=file.getvalue(), filetype="pdf")
+                    for page_number in range(min(2, document.page_count)):
+                        pixmap = document[page_number].get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                        st.image(pixmap.tobytes("png"), caption=f"Page {page_number + 1}", use_container_width=True)
+                    document.close()
+                except Exception as exc:
+                    st.error(f"PDF preview failed: {exc}")
+            elif info["type"] == "image":
+                st.image(file.getvalue(), caption=file.name, use_container_width=True)
+            elif info["type"] == "table":
+                st.dataframe(info["df"], use_container_width=True)
+            else:
+                st.write("Preview is available for uploaded images and tables.")

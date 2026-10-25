@@ -1,155 +1,155 @@
-# AI-Powered Vendor Quotation Comparison System (Rule-Based, CPU-Only)
+# AI Vendor Selection and Quotation Analysis
 
-A clean, modular Streamlit prototype to compare multiple vendor quotations (PDF, images, CSV, XLSX) using **regex + heuristics** (no LLMs, no external APIs).
+Compare supplier quotations using existing PDF, image/OCR, CSV, and Excel extraction, then ask a local Ollama model to rank the extracted evidence according to your purchasing priorities. The backend validates the response and enforces explicit budget and delivery limits; it does not use a weighted score to select a winner.
 
-## Quick Start (Streamlit)
+## What the application does
 
-```bash
-python -m pip install -r requirements.txt
-python -m streamlit run app/streamlit_app.py
+1. Accepts quotations in PDF, DOCX, PNG/JPG, CSV, or XLSX format.
+2. Extracts fields using the existing text, table, and OCR pipeline.
+3. Normalizes known monetary values to INR. The default conversion assumption is `1 USD = 83 INR`.
+4. Keeps an explicitly quoted payable total separate from a calculated total. Calculations use extracted amounts only; missing charges remain unknown and are reported rather than silently treated as zero.
+5. Sends only structured quotation evidence and the user's requirements to Ollama.
+6. Validates the JSON response, vendor IDs, and ranks. Invalid responses receive one repair attempt.
+7. Applies explicitly stated maximum budget and delivery constraints as hard eligibility checks. If no vendor can be verified against the constraints, the result is inconclusive.
+
+The model explains each vendor's advantages, disadvantages, costs, delivery, payment terms, risks, missing information, and confidence. It must not infer vendor reliability without evidence. Content from quotations is treated as untrusted data, not as instructions to the model.
+
+## Requirements
+
+- Python 3.11 or later
+- Node.js and npm (for the React frontend)
+- Ollama installed and running locally
+- Tesseract OCR installed and on `PATH` for scanned PDFs and image quotations
+- Python dependencies from `requirements.txt`, including `python-docx` for DOCX
+
+## Ollama setup
+
+1. Install Ollama from [ollama.com/download](https://ollama.com/download).
+2. Start the Ollama application/service.
+3. Pull the default model:
+
+   ```powershell
+   ollama pull llama3.2
+   ```
+
+4. Confirm the local API is responding:
+
+   ```powershell
+   ollama list
+   ```
+
+The default local API URL is `http://localhost:11434`. The model is configurable with `OLLAMA_MODEL`; a different locally pulled Ollama chat model may be used if it supports JSON output. Model speed and quality depend on available system resources.
+
+## Environment variables
+
+Copy `.env.example` to `.env` in the repository root and edit it as needed. The backend loads this file at startup; process environment variables override its values. Ollama configuration is not exposed to the browser.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama API base URL |
+| `OLLAMA_MODEL` | `llama3.2` | Model name available to Ollama |
+| `OLLAMA_TIMEOUT_SECONDS` | `120` | Request timeout |
+
+Alternatively, set values directly in PowerShell:
+
+```powershell
+$env:OLLAMA_BASE_URL = "http://localhost:11434"
+$env:OLLAMA_MODEL = "llama3.2"
+$env:OLLAMA_TIMEOUT_SECONDS = "120"
 ```
 
-## Quick Start (React UI + API backend)
+## Run the application
 
-Backend (FastAPI):
+Install Python dependencies from the repository root:
 
-```bash
+```powershell
 python -m pip install -r requirements.txt
+```
+
+### React UI with FastAPI
+
+Start the backend from the repository root:
+
+```powershell
 python -m uvicorn backend.main:app --reload --port 8000
 ```
 
-Frontend (Vite/React):
+In another terminal, start the React frontend:
 
-```bash
-cd "ui/ai-outreach-hub-main (2)/ai-outreach-hub-main"
+```powershell
+cd "ui\ai-outreach-hub-main (2)\ai-outreach-hub-main"
 npm install
 npm run dev
 ```
 
-On Windows, activate the virtual environment first, then use `python -m ...` commands. This avoids broken launcher paths if the project folder was moved.
+The frontend calls `http://localhost:8000` by default. Set `VITE_API_BASE_URL` in the frontend `.env` to change the API address. Ollama URL/model settings belong only in the backend environment.
 
-The UI calls the backend at `http://localhost:8000` by default. To change it, set `VITE_API_BASE_URL` in the frontend.
+### Streamlit UI
 
-### Sample files
+From the repository root:
 
-This repo includes sample quotations in `data/sample_quotes/` (CSV + PDF + PNG).
-
-Optional: regenerate them anytime:
-
-```bash
-python data/sample_quotes/generate_sample_quotes.py
+```powershell
+python -m streamlit run app\streamlit_app.py
 ```
 
-## History (SQLite)
+Both interfaces require the backend runtime dependencies and an available Ollama model. Streamlit calls the same local evaluation service directly.
 
-Every analysis run is saved as a session to SQLite at `data/outputs/history.db`.
-Use the left sidebar (**📜 History**) to open past sessions or clear history.
+## Evaluation behavior and limitations
 
-## Export
+- The LLM ranks quotations qualitatively against the user's stated priorities. No fixed cost/delivery/payment weights or score are used.
+- Values marked missing by extraction stay `null`/missing evidence; quantity, GST, delivery, payment, currency, and charges are not assigned fabricated defaults.
+- Field status distinguishes a source-backed value, a calculated value, an explicit not-applicable charge, a value that was not provided, and a value that is present but could not be parsed.
+- A quoted payable total, when clearly labeled, is kept separately from the deterministic breakdown total. The breakdown applies explicit discount, GST, freight, other taxes, and additional charges only when the inputs are available. Unmentioned charges remain unknown instead of being treated as zero.
+- Tax-inclusive quotations are identified when the document states this and GST is not added a second time. Totals that conflict with the known breakdown are flagged for review.
+- Extracted fields include source text/evidence and a confidence label (`source-backed`, `calculated`, or `unavailable`). These labels describe provenance, not statistical OCR confidence.
+- INR and USD quotations (using the configured USD conversion rate) can be compared. Other or unidentified currencies remain unknown rather than being silently treated as INR.
+- `delivery_reliability` is not currently extracted from vendor history. The application does not claim reliability unless the evidence actually contains it.
+- Explicit limits phrased as a maximum/under/within budget or delivery period are enforced deterministically. Review the extracted data because OCR and heuristic extraction can still be wrong.
+- The model's explanation is advisory, not a substitute for procurement review. Check the uploaded quotation and audit details before placing an order.
+- Ollama does not need external paid APIs. The frontend does not call the model directly.
 
-- CSV export: built-in
-- Excel export: generated as `.xlsx` without extra dependencies (see `utils/xlsx_writer.py`)
+## Troubleshooting
 
-## Supported Inputs
+- **Ollama unavailable:** start the Ollama service and confirm `OLLAMA_BASE_URL` is reachable.
+- **Model not found:** run `ollama pull <model>` and ensure `OLLAMA_MODEL` matches `ollama list`.
+- **Timeout:** increase `OLLAMA_TIMEOUT_SECONDS` or use a smaller model that fits available memory.
+- **Invalid AI response:** the service retries once with a schema repair prompt; persistent invalid output returns an explicit API error rather than a fabricated ranking.
+- **OCR unavailable:** install Tesseract OCR and ensure `tesseract.exe` is on `PATH`. PDF text extraction does not require OCR when text is embedded.
+- **Incorrect values:** check the file preview and audit trail. Correct the source quotation or extraction result before relying on an evaluation.
+- **DOCX table extraction:** tables with a header row are mapped by their column labels. Review extracted source evidence for unusual multi-line or merged-cell layouts.
 
-- PDF: text extraction via PyMuPDF (`fitz`), with OCR fallback for scanned PDFs (first page)
-- Images (`.png/.jpg`): OCR via `pytesseract` with OpenCV preprocessing
-- CSV: `pandas.read_csv`
-- XLSX: lightweight stdlib-based parser (no `openpyxl` required)
+## Manual quotation checks
 
-## Extracted Fields (Rule-Based)
+The repository includes example quotations under `data/sample_quotes/`. To verify a PDF-only run, upload `sample_alpha.pdf`, `sample_beta.pdf`, and `sample_gamma.pdf` together in the React dashboard and enter priorities/limits that reflect your purchase. For a mixed-format run, upload `sample_alpha.pdf`, `vendor_beta_traders.csv`, and `sample_gamma.png` together. Check the displayed source evidence and missing-field warnings against each original document before relying on the recommendation.
 
-- `vendor_name`
-- `item_name`
-- `quantity`
-- `unit_price`
-- `total_price`
-- `gst_percent`
-- `delivery_days`
-- `payment_terms_days`
-- `delivery_text`
-- `payment_terms_text`
-- `penalty_clause`
-- `freight_cost`
+The separate Apex/BrightTech/Nova values in the feature request are not present in the repository's sample documents. The automated constraint test uses those values only as test inputs; no vendor names or expected ranks are hardcoded in production code.
 
-Missing values are filled with defaults and tracked in `missing_fields` for scoring penalties.
+## History and exports
 
-## Normalization
+Analysis history is stored in SQLite at `data/outputs/history.db`. Results can be exported to CSV or Excel. The older database `final_score` field is retained for schema compatibility and is stored as `0`; it is not an AI score or used for ranking.
 
-- Currency normalized to INR
-- Assumption: `1 USD = 83 INR`
-- Delivery/payment text normalized to numeric days (e.g. `Net 30`, `2 weeks`, `Immediate`)
-- Produces `base_cost` for the cost engine
+## Project layout
 
-## Scoring
-
-Final score (0-100):
-
-```
-(0.60 * Cost Score) + (0.25 * Delivery Score) + (0.15 * Terms Score)
+```text
+app/                 Streamlit UI
+backend/             FastAPI endpoints, persistence models, database
+core/                Extraction, OCR, normalization, Ollama evaluation, history
+data/sample_quotes/  Example quotations
+ui/                  React + TypeScript frontend
+utils/               Currency/date helpers and Excel export
 ```
 
-- Lower `total_cost` -> higher cost score
-- Faster delivery -> higher delivery score
-- Longer payment terms -> higher terms score
-- Missing fields reduce the relevant sub-score
+## Tests
 
-## Cost Engine (Total Landed Cost)
+Run the mocked Ollama service tests from the repository root:
 
-The system computes a transparent landed-cost breakdown in `core/cost_engine.py`:
-
-```
-total_cost =
-    base_cost
-  + gst_amount
-  + freight_cost
-  + credit_cost            (penalizes payment terms shorter than baseline)
-  + delay_penalty_cost     (risk cost when delivery > SLA)
-  + missing_data_risk_cost
+```powershell
+python -m unittest discover -s tests -v
 ```
 
-- Assumptions: interest rate = 12% p.a., baseline payment terms = 30 days, SLA delivery = 14 days
+Run frontend checks from `ui\ai-outreach-hub-main (2)\ai-outreach-hub-main`:
 
-## Project Structure
-
+```powershell
+npm test
+npm run build
 ```
-vendor-selection/
-  app/
-    streamlit_app.py
-  core/
-    ingestion.py
-    ocr.py
-    extraction.py
-    normalization.py
-    cost_engine.py
-    scoring.py
-    comparison.py
-    explanation.py
-    history.py
-  utils/
-    currency.py
-    date_parser.py
-    xlsx_writer.py
-  data/
-    sample_quotes/
-    outputs/
-  requirements.txt
-  README.md
-```
-
-## Notes (OCR)
-
-`pytesseract` requires the Tesseract binary installed on your machine.
-
-- Windows: install Tesseract and ensure `tesseract.exe` is in PATH.
-- If OCR is not available, image-based quotes will show an OCR-unavailable message.
-
-### Windows OCR setup (recommended)
-
-- Install Tesseract OCR (Windows):
-  - Option A (winget): `winget install --id UB-Mannheim.TesseractOCR -e`
-  - Option B: install from the UB Mannheim build and note the install path.
-- If it is not on PATH, set an environment variable:
-  - `TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe`
-
-The app will auto-detect common install locations, but setting `TESSERACT_CMD` is the most reliable.
